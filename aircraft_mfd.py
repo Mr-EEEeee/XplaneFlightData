@@ -42,7 +42,15 @@ import time
 import os
 from pathlib import Path
 import subprocess
-import pygame
+import ctypes
+import ctypes.util
+
+try:
+    import pygame.joystick
+    PYGAME_AVAILABLE = True
+except ImportError:
+    PYGAME_AVAILABLE = False
+    print("Warning: pygame not available. Install with: pip install pygame")
 
 
 class XPlaneAPI:
@@ -103,11 +111,10 @@ class XPlaneAPI:
 
 
 class USBDeviceManager:
-    """Manager for F16 MFD 2 USB device input"""
+    """Manager for F16 MFD 2 USB device input using SDL2 joystick API"""
     
-    # F16 MFD 2 device identifiers
-    TARGET_VENDOR_ID = 0x044f  # ThrustMaster, Inc.
-    TARGET_PRODUCT_ID = 0xb352  # F16 MFD 2
+    # F16 MFD 2 device identifiers (hardcoded as requested)
+    TARGET_NAME = "Thrustmaster F16 MFD 2"  # Exact device name
     
     def __init__(self, button_callback):
         """Initialize USB device manager
@@ -118,37 +125,54 @@ class USBDeviceManager:
         self.button_callback = button_callback
         self.joystick = None
         self.device_connected = False
-        self.last_button_states = {}
+        self.last_button_states = [False] * 28  # F16 MFD 2 has 28 buttons
+        self.sdl = None
         
-        # Initialize pygame for joystick support
+        if not PYGAME_AVAILABLE:
+            print("pygame not available - using keyboard fallback only")
+            return
+        
+        # Load SDL2 library to call SDL_JoystickUpdate directly
+        # Use pygame's bundled SDL2 to match the joystick instance
         try:
-            pygame.init()
-            pygame.joystick.init()
-            self.detect_device()
+            import pygame
+            # Try .dylibs subfolder first (pygame 2.x)
+            sdl_path = os.path.join(os.path.dirname(pygame.__file__), '.dylibs', 'libSDL2-2.0.0.dylib')
+            if os.path.exists(sdl_path):
+                self.sdl = ctypes.CDLL(sdl_path)
+                print(f"  - Loaded SDL2 from pygame: {sdl_path}")
+            else:
+                # Fallback to root pygame folder
+                sdl_path = os.path.join(os.path.dirname(pygame.__file__), 'libSDL2-2.0.0.dylib')
+                if os.path.exists(sdl_path):
+                    self.sdl = ctypes.CDLL(sdl_path)
+                    print(f"  - Loaded SDL2 from pygame: {sdl_path}")
         except Exception as e:
-            print(f"Failed to initialize pygame: {e}")
+            print(f"  - Could not load SDL2: {e}")
+        
+        # Try to connect to the device
+        self.detect_device()
     
     def detect_device(self):
         """Detect and initialize the F16 MFD 2 device"""
         try:
+            # Initialize only joystick subsystem
+            pygame.joystick.init()
+            
             joystick_count = pygame.joystick.get_count()
             
             for i in range(joystick_count):
                 joy = pygame.joystick.Joystick(i)
+                device_name = joy.get_name()
                 
-                # Get device IDs - pygame doesn't expose vendor/product IDs directly,
-                # so we'll match by name as a fallback
-                device_name = joy.get_name().lower()
-                
-                # Check if this looks like the F16 MFD device
-                if "f16" in device_name or "mfd" in device_name or "thrustmaster" in device_name.lower():
+                # Match exact device name (hardcoded as requested)
+                if device_name == self.TARGET_NAME:
                     joy.init()
                     self.joystick = joy
                     self.device_connected = True
-                    print(f"✓ F16 MFD 2 detected: {joy.get_name()}")
+                    print(f"✓ F16 MFD 2 detected: {device_name}")
                     print(f"  - Buttons: {joy.get_numbuttons()}")
-                    print(f"  - Axes: {joy.get_numaxes()}")
-                    print(f"  - Hats: {joy.get_numhats()}")
+                    print(f"  - Using SDL2 joystick API")
                     
                     # Initialize button states
                     for btn in range(joy.get_numbuttons()):
@@ -168,24 +192,31 @@ class USBDeviceManager:
         
         Returns True if device is still connected, False otherwise
         """
-        if not self.device_connected:
+        if not self.device_connected or not self.joystick:
             return False
         
         try:
-            # Process pygame events to update joystick state
-            # This MUST be called from the main thread on macOS
-            pygame.event.pump()
+            # Call SDL_JoystickUpdate directly to update joystick state
+            # This avoids pygame's event system which conflicts with tkinter
+            if self.sdl:
+                try:
+                    self.sdl.SDL_JoystickUpdate()
+                except Exception as e:
+                    pass  # Silently ignore SDL_JoystickUpdate errors
             
-            # Check each button
+            # Read button states directly
             for btn_idx in range(self.joystick.get_numbuttons()):
                 button_pressed = self.joystick.get_button(btn_idx)
                 
                 # Detect button press (transition from not pressed to pressed)
-                if button_pressed and not self.last_button_states.get(btn_idx, False):
+                if button_pressed and not self.last_button_states[btn_idx]:
                     # Map button index to panel number (0-9)
-                    # You may need to adjust this mapping based on your device
                     if btn_idx <= 9:
+                        print(f"✓ F16 MFD button {btn_idx} pressed → switching to panel {btn_idx}")
                         self.button_callback(btn_idx)
+                    else:
+                        # Button > 9, just show it was pressed for debugging
+                        print(f"  (F16 MFD button {btn_idx} pressed - not mapped)")
                 
                 self.last_button_states[btn_idx] = button_pressed
             
@@ -193,6 +224,8 @@ class USBDeviceManager:
             
         except Exception as e:
             print(f"Error polling USB device: {e}")
+            import traceback
+            traceback.print_exc()
             self.device_connected = False
             return False
     
@@ -203,9 +236,14 @@ class USBDeviceManager:
     def cleanup(self):
         """Clean up resources"""
         if self.joystick:
-            self.joystick.quit()
-        pygame.joystick.quit()
-        pygame.quit()
+            try:
+                self.joystick.quit()
+            except:
+                pass
+        try:
+            pygame.joystick.quit()
+        except:
+            pass
 
 
 class AircraftMFD:
@@ -602,8 +640,12 @@ class AircraftMFD:
         Args:
             button_number: Button index from USB device (0-9)
         """
-        # Use root.after to ensure GUI updates happen in main thread
-        self.root.after(0, lambda: self.switch_display_mode(button_number))
+        # We're already on the main thread (called from update_display),
+        # so we can update the display directly without queuing
+        self.switch_display_mode(button_number)
+        
+        # Force immediate UI update to eliminate any delay
+        self.root.update_idletasks()
     
     def on_closing(self):
         """Handle window close event"""
