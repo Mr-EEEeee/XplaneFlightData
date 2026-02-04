@@ -19,8 +19,41 @@
 #include <numbers>
 #include <string_view>
 #include <memory>
+#include <array>
 
 namespace xplane_mfd::calc {
+
+constexpr int max_ias_history = 20;
+// Use large array instead of memory allocation
+struct SensorHistoryBuffer { 
+    //  The pre-allocated, fixed-size buffer. 
+    std::array<double, max_ias_history> data; 
+    
+    int head_index = 0; 
+    int current_size = 0; 
+
+
+    void add_reading(double new_ias) { 
+        data[head_index] = new_ias; 
+        
+        // Move the head to the next position, wrapping around if necessary. 
+        head_index = (head_index + 1) % max_ias_history; 
+        
+        // The buffer size grows until it's full. 
+        if (current_size < max_ias_history) { 
+            current_size++; 
+        } 
+    } 
+
+
+    const double* get_data_ptr() const { 
+        return data.data(); 
+    } 
+    
+    int get_size() const { 
+        return current_size; 
+    } 
+};
 
 constexpr double DEG_TO_RAD = std::numbers::pi / 180.0;
 constexpr double RAD_TO_DEG = 180.0 / std::numbers::pi;
@@ -53,32 +86,21 @@ double normalize_angle(double angle) {
     return angle;
 }
 
-// ========================================================================
-// REMOVE BEFORE FLIGHT - Recursion
-// ========================================================================
-/**
- * Recursive binomial coefficient calculation (n choose k)
- * Used for calculating combinations of alternate airports in flight planning
- * 
- * Formula: C(n,k) = "n choose k" = number of ways to select k items from n items
- * Recursive relation: C(n,k) = C(n-1,k-1) + C(n-1,k)
- * 
- * @param n Total number of items
- * @param k Number of items to choose
- * @return Number of combinations
- * 
- * Example: binomial_coefficient(5, 2) = 10
- *          (5 nearby airports, choose 2 as alternates = 10 possible combinations)
- */
 [[nodiscard]] unsigned long long binomial_coefficient(unsigned int n, unsigned int k) {
-    // Base cases
-    if (k > n) return 0;           // Can't choose more than available
-    if (k == 0 || k == n) return 1; // C(n,0) = C(n,n) = 1
-    if (k == 1) return n;           // C(n,1) = n
+    // Base case
+    if (k > n) return 0;
+    if (k == 0 || k == n) return 1;    // C(n,0) = C(n,n) = 1
+    if (k == 1) return n;              // C(n,1) = n
     
-    // Recursive relation: C(n,k) = C(n-1,k-1) + C(n-1,k)
-    // This represents: either include current item or don't
-    return binomial_coefficient(n - 1, k - 1) + binomial_coefficient(n - 1, k);
+    if (k > n - k) k = n - k;          // Optimize: C(n,k) = C(n,n-k)
+
+    unsigned long long result = 1;
+    // C(n,k) = [n*(n-1)*...*(n-k+1)] / [k*(k-1)*...*1]
+    for (unsigned int i = 1; i <= k; ++i) {
+        result *= (n - k + i);
+        result /= i;
+    }
+    return result;
 }
 
 /**
@@ -98,7 +120,7 @@ struct WindData {
     double gs_kts,
     double heading_deg,
     double track_deg,
-    const std::vector<double>& ias_history // Past airspeeds for gust calc
+    const SensorHistoryBuffer& ias_history // Past airspeeds for gust calc
 ) {
     WindData result;
     
@@ -132,24 +154,18 @@ struct WindData {
     result.headwind = -result.speed_kts * std::cos(rel_wind_rad);
     result.crosswind = result.speed_kts * std::sin(rel_wind_rad);
     
-    // ========================================================================
-    // REMOVE BEFORE FLIGHT - Memory allocation
-    // ========================================================================
-    if (!ias_history.empty()) {
-        auto history_buffer = std::make_unique<double[]>(ias_history.size());
-
-        // Copy data into our dynamic buffer for analysis
-        for (size_t i = 0; i < ias_history.size(); ++i) {
-            history_buffer[i] = ias_history[i];
-        }
-
+    if (ias_history.get_size() > 0) {
         double max_ias = 0;
         double sum_ias = 0;
-        for (size_t i = 0; i < ias_history.size(); ++i) {
-            if (history_buffer[i] > max_ias) max_ias = history_buffer[i];
-            sum_ias += history_buffer[i];
+        const auto* buffer_data = ias_history.get_data_ptr();
+        int size = ias_history.get_size();
+
+        for (int i = 0; i < size; ++i) {
+            double val = buffer_data[i];
+            if (val > max_ias) max_ias = val;
+            sum_ias += val;
         }
-        double avg_ias = sum_ias / ias_history.size();
+        double avg_ias = sum_ias / size;
 
         // The gust factor is the difference between the peak and average speed
         result.gust_factor = max_ias - avg_ias;
@@ -414,7 +430,10 @@ int main(int argc, char* argv[]) {
         
         // Create a sample history of airspeeds to pass to the calculator.
         // In a real system, this would come from a sensor data buffer.
-        std::vector<double> ias_history = {145.5, 148.0, 151.2, 149.5, 155.8, 152.1};
+        SensorHistoryBuffer ias_history;
+        for (double val : {145.5, 148.0, 151.2, 149.5, 155.8, 152.1}) {
+            ias_history.add_reading(val);
+        }
         
         // 1. Calculate wind vector (with the MODIFIED call)
         WindData wind = calculate_wind_vector(tas_kts, gs_kts, heading, track, ias_history);
